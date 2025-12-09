@@ -1,0 +1,258 @@
+import configparser
+import os
+import smtplib
+import pandas as pd
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from google.cloud import bigquery
+from datetime import datetime 
+
+def send_email(subject, body, to_email):
+    """
+    Sends spike alert email to table owners using SMTP 
+    """
+    sender_email = "do-not-reply@verizon.com"
+    msg = MIMEMultipart()
+    msg['From'] = sender_email
+    msg['To'] = ", ".join(to_email)
+    msg['Subject'] = subject
+    msg.attach(MIMEText(body, 'html'))
+    
+    try:
+        server = smtplib.SMTP('tpaapd1kva109.verizon.com')
+        server.starttls()
+        server.sendmail(sender_email, to_email, msg.as_string())
+        server.quit()
+        print(f"Email sent to {to_email}")
+    except Exception as e:
+        print(f"Error sending email to {to_email}: {e}") 
+
+def get_spike_details(config_params):
+    """
+    Fetches spike details from BigQuery based on the provided configuration parameters. 
+     
+    """
+    client = bigquery.Client()
+    reporting_tbl = f"{config_params['project_name']}.{config_params['dataset_name']}.{config_params['reporting_tbl']}"
+    metadata_tbl = f"{config_params['project_name']}.{config_params['dataset_name']}.{config_params['metadata_tbl']}"
+    query = f'''
+      WITH filtered_hist AS (
+        SELECT 
+          M.src_tbl,
+          M.rule_id,
+          R.col_tot_cnt,
+          DATE(R.rule_run_dt) AS rule_run_date
+        FROM 
+          `{reporting_tbl}` R
+        JOIN 
+          `{metadata_tbl}` M
+        ON 
+          R.rule_id = M.rule_id
+        WHERE 
+          M.is_active_flg = 'Y' 
+          AND DATE(rule_run_dt) > DATE_SUB(CURRENT_DATE(), INTERVAL 3 MONTH)
+), 
+
+filtered_curnt AS (
+      SELECT  
+        M.src_tbl,
+        M.rule_id,
+        R.col_tot_cnt
+      FROM 
+        `{reporting_tbl}` R
+      JOIN 
+        `{metadata_tbl}` M
+      ON 
+        R.rule_id = M.rule_id
+      WHERE 
+        M.is_active_flg = 'Y' 
+        AND DATE(R.rule_run_dt) = CURRENT_DATE() - 1
+),
+
+aggregated AS ( 
+    SELECT 
+      h.src_tbl, 
+      MAX(c.col_tot_cnt) AS today_tot_count,
+      AVG(
+        CASE 
+          WHEN DATE(rule_run_date) BETWEEN DATE_SUB(DATE_TRUNC(CURRENT_DATE(), WEEK(SUNDAY)), INTERVAL 1 WEEK) 
+                                        AND DATE_SUB(DATE_TRUNC(CURRENT_DATE(), WEEK(SUNDAY)), INTERVAL 1 DAY)
+          THEN h.col_tot_cnt
+        END
+      ) AS last_week_avg,
+      AVG(
+        CASE 
+          WHEN DATE(rule_run_date) BETWEEN DATE_SUB(DATE_TRUNC(CURRENT_DATE(), MONTH), INTERVAL 4 MONTH) 
+                                        AND DATE_SUB(DATE_TRUNC(CURRENT_DATE(), MONTH), INTERVAL 1 DAY)
+          THEN h.col_tot_cnt
+        END
+      ) AS last_3_months_avg
+  FROM 
+    filtered_hist h
+  JOIN 
+    filtered_curnt c 
+  ON 
+    h.rule_id = c.rule_id
+  GROUP BY 
+    h.src_tbl
+)
+
+SELECT 
+  src_tbl AS table_name,
+  today_tot_count  AS today_total_count,
+  ROUND(last_week_avg, 2) AS last_week_avg,
+  ROUND(today_tot_count - COALESCE(last_week_avg, 0), 2) AS week_diff,
+  ROUND(last_3_months_avg, 2) AS last_3_months_avg,
+  ROUND(today_tot_count - COALESCE(last_3_months_avg, 0), 2) AS quarter_diff
+FROM 
+  aggregated 
+ORDER BY 
+  src_tbl;
+  '''
+    try:
+        query_job = client.query(query)
+        results = query_job.result()
+        return [dict(row) for row in results]
+    except Exception as e:
+        print(f"Error fetching spike data: {e}")
+        return []
+
+def format_email_body_html(table_group_results, config_params):
+    """
+    Formats the email body in HTML based on the spike results. 
+    """
+    df = pd.DataFrame(table_group_results)
+
+    headers = df.columns.tolist()
+
+     # Generate table headers
+    headers_html = "".join(f"<th>{header}</th>" for header in headers)
+
+    # Generate table rows
+    rows_html = ""
+    for _, row in df.iterrows():
+        rows_html += "<tr>" + "".join(f"<td>{row[header]}</td>" for header in headers) + "</tr>"
+
+    # Email body
+    html = f"""
+    <html>
+    <body>
+        <p>Dear Team,</p>
+
+        <p>We have observed a spike in invalid records for one or more tables that exceeds the defined threshold levels. Please find the details below:</p>
+
+        <p><strong>Dashboard Link:</strong> <a href="{config_params['qlik_link']}">View Dashboard</a></p>
+
+        <p><strong>Table Details:</strong></p>
+        <table border="1" style="border-collapse: collapse; width: 100%;">
+            <thead style="background-color: #ADD8E6;">
+                <tr>
+                    {headers_html}
+                </tr>
+            </thead>
+            <tbody>
+                {rows_html}
+            </tbody>
+        </table>
+
+        <p>If you have any questions or need further assistance, please feel free to reach out to the <a href="mailto:OneCorpDataQuality@verizon.com">OneCorp Data Quality Team</a>.</p>
+
+        <p>Thank you,<br/>OneCorp Data Quality Team</p>
+    </body>
+    </html>
+    """
+    return html
+   
+
+def check_threshold_get_owners(df1, config_params):
+    """
+    Fetches data owners for matching table names in DF1-spike data from report table 
+    by joining with data owners table 
+    with respect to the table threshold.
+    """
+    client = bigquery.Client()
+    one_corp_dq_data_owners_tbl_name = f"{config_params['project_name']}.{config_params['dataset_name']}.{config_params['one_corp_dq_data_owners_tbl_name']}"
+    query = f"""
+    SELECT table_name, tech_owner_email, table_threshold
+    FROM `{one_corp_dq_data_owners_tbl_name}`
+    """
+    try:
+        query_job = client.query(query)
+        results = query_job.result()
+        
+        # Convert query results into DataFrame DF2
+        df2 = pd.DataFrame([dict(row) for row in results])
+        
+        # Join DF1 with DF2 on table_name
+        merged_df = pd.merge(df1, df2, on='table_name', how='inner')
+
+        # Convert table_threshold to integer for comparison
+        merged_df['table_threshold'] = merged_df['table_threshold'].str.replace("'","").astype(int)
+
+        # Filter rows where both week_diff and quarter_diff exceed the threshold
+        filtered_df = merged_df[
+            (merged_df['week_diff'] > merged_df['table_threshold']) &
+            (merged_df['quarter_diff'] > merged_df['table_threshold'])
+        ]
+
+        # Extract unique email addresses for the filtered rows
+        emails = {
+            email
+            for tech_emails in filtered_df['tech_owner_email']
+            for email in tech_emails.split(",")
+        }
+
+        return list(emails)
+    
+    except Exception as e: 
+        print(f"Error fetching data owners: {e}")
+        return [] 
+    
+def _read_config(env):
+    """
+    Reads the configuration for the specified environment.
+    """
+    config = configparser.ConfigParser()
+    env_config = {}
+    try:
+        config.read('env_config.ini')
+        if config.has_section('commons'):
+            env_config.update(dict(config.items('commons')))
+        if config.has_section(env):
+            env_config.update(dict(config.items(env)))
+        return env_config
+    except Exception as e:
+        print(f"Error reading config: {e}")
+        return {} 
+    
+def main(request):
+    """
+    Main function to fetch spike data and send emails to data owners.
+    """
+    environment = os.getenv('ENVIRONMENT', 'DEV')
+    print(f"Environment: {environment}")
+    config_params = _read_config(environment)
+    
+    # Fetch spike data
+    spike_data = get_spike_details(config_params)
+    if not spike_data:
+        print("No spike data found.")
+        return 'No spike data found.'
+    
+    # Convert spike data to DataFrame DF1
+    df1 = pd.DataFrame(spike_data)
+    
+    # Process each table
+    for table_name, group in df1.groupby('table_name'):
+        to_email = check_threshold_get_owners(group, config_params)  # Pass DF1 group to check_threshold_get_owners
+        if not to_email:
+            print(f"Table: {table_name} is below the threshold level")
+            continue
+        
+        # Format email content and send email
+        html_body = format_email_body_html(group.to_dict('records'),config_params)
+        subject = f"<{environment}> Spike Alert - {table_name} - {datetime.now().strftime('%d %B %Y')}"
+        send_email(subject, html_body, to_email)
+        print(f"Email sent for table_name: {table_name}")
+    
+    return 'Spike alert emails sent successfully.'
